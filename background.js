@@ -232,9 +232,21 @@ function classify(details) {
     if (details.type === 'xmlhttprequest' && !isMediaMime && !isMediaExt) return null;
   }
 
-  const size = parseInt(headers['content-length'] || '0', 10) || 0;
+  // 206 的 content-length 只是本次返回的分片长度，总大小必须从 Content-Range 的 "0-1/1234567" 取
+  const rangeTotal = contentRangeTotal(headers['content-range']);
+  let size = rangeTotal || (parseInt(headers['content-length'] || '0', 10) || 0);
+  const ranges = String(headers['accept-ranges'] || '').toLowerCase().indexOf('bytes') >= 0 ||
+    !!headers['content-range'];
+
   const kind = isHls ? 'hls' : isDash ? 'dash' : isSub ? 'sub' : 'file';
-  return { url: url, kind: kind, mime: mime, size: size };
+  return { url: url, kind: kind, mime: mime, size: size, ranges: ranges };
+}
+
+/* Content-Range: bytes 0-1/1234567 → 1234567（拿不到时返 0） */
+function contentRangeTotal(value) {
+  if (!value) return 0;
+  const m = /\/(\d+)\s*$/.exec(String(value));
+  return m ? parseInt(m[1], 10) || 0 : 0;
 }
 
 function addNetworkItem(details) {
@@ -252,8 +264,9 @@ function addNetworkItem(details) {
 
   if (prev) {
     prev.mime = info.mime || prev.mime;
-    prev.size = info.size || prev.size;
+    prev.size = Math.max(prev.size || 0, info.size || 0);
     prev.kind = prev.kind === 'file' && info.kind !== 'file' ? info.kind : prev.kind;
+    if (info.ranges) prev.ranges = true;
     prev.ts = Date.now();
   } else {
     st.items.set(key, {
@@ -264,6 +277,7 @@ function addNetworkItem(details) {
       kind: info.kind,
       mime: info.mime,
       size: info.size,
+      ranges: !!info.ranges,
       title: '',
       poster: '',
       duration: 0,
@@ -390,8 +404,25 @@ function getVariants(tabId) {
 
 /* ---------------- 下载 ---------------- */
 
+/* downloads API 在 Firefox 上仍是回调式，这里统一包成 Promise */
+function downloadsDownload(options) {
+  return new Promise((resolve, reject) => {
+    try {
+      const ret = chrome.downloads.download(options, (id) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(id);
+      });
+      // Chrome 上若不传回调会返回 Promise；传了回调则返回 undefined
+      if (ret && typeof ret.then === 'function') ret.then(resolve, reject);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
 async function startDirectDownload(url, filename, tabId, frameId, retried) {
-  const downloadId = await chrome.downloads.download({
+  const downloadId = await downloadsDownload({
     url: url,
     filename: safeFilename(filename),
     conflictAction: 'uniquify',
@@ -404,6 +435,7 @@ async function startDirectDownload(url, filename, tabId, frameId, retried) {
   }
   return downloadId;
 }
+
 
 chrome.downloads.onChanged.addListener(async (delta) => {
   if (!delta.state) return;
@@ -507,6 +539,23 @@ async function handleMessage(msg, sender) {
 
     case 'clearTab': {
       clearTab(typeof msg.tabId === 'number' ? msg.tabId : senderTabId, true);
+      return { ok: true };
+    }
+
+    /* 内容脚本探测到 DRM / 受保护流时回写标记，弹窗据此禁止下载并说明原因 */
+    case 'vdh:flag': {
+      if (senderTabId < 0) return { ok: false };
+      const st = tabState(senderTabId);
+      const key = normalizeKey(msg.key || '');
+      const item = key ? st.items.get(key) : null;
+      if (item) {
+        item.drm = !!msg.drm;
+        item.drmReason = msg.reason || '';
+        // 顺带记录内容脚本实测到的体积（直链 206 或下载后实测）
+        if (msg.size) item.size = msg.size;
+        if (msg.ranges) item.ranges = true;
+        persistTab(senderTabId);
+      }
       return { ok: true };
     }
 

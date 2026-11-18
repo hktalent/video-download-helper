@@ -53,6 +53,9 @@
         done: job.done,
         total: job.total,
         bytes: job.bytes,
+        mode: job.mode || '',
+        skipped: job.skipped || 0,
+        warn: job.warn || '',
         error: job.error || '',
         ts: now
       }
@@ -87,6 +90,14 @@
           current.phase = phase;
           emit(true);
         },
+        setMode: (mode) => {
+          current.mode = mode;
+          emit(true);
+        },
+        addSkipped: (n) => {
+          current.skipped = (current.skipped || 0) + (n || 0);
+          if (current.skipped) current.warn = '有 ' + current.skipped + ' 个分片损坏已被跳过';
+        },
         onProgress: (p) => {
           current.done = p.done;
           current.total = p.total;
@@ -100,7 +111,9 @@
       try {
         await work(ctx);
         current.state = 'done';
-        current.phase = '已完成';
+        current.phase = current.skipped
+          ? '已完成 · 跳过 ' + current.skipped + ' 个损坏分片'
+          : '已完成';
         emit(true);
       } catch (err) {
         if (current.cancelled) {
@@ -125,9 +138,57 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async function fetchBuffer(url, range, signal) {
+  const MAX_SEGMENT_ATTEMPTS = 6;      // 单分片最多尝试次数（对齐原版 6 次）
+  const SEGMENT_TIMEOUT_MS = 20000;    // 单次请求超时
+  const WHOLE_FILE_TIMEOUT_MS = 60000; // 整文件下载超时
+
+  function abortError() {
+    try {
+      return new DOMException('已取消', 'AbortError');
+    } catch (e) {
+      const err = new Error('已取消');
+      err.name = 'AbortError';
+      return err;
+    }
+  }
+
+  /* 判断某次失败是否值得重试：4xx（除 408/425/429）直接放弃，其余重试 */
+  function isRetryable(err) {
+    if (!err) return false;
+    if (err.name === 'AbortError') return false;
+    if (err.name === 'TimeoutError') return true;
+    const message = String(err.message || '');
+    const http = /^HTTP (\d{3})/.exec(message);
+    if (http) {
+      const code = Number(http[1]);
+      return code === 408 || code === 425 || code === 429 || code >= 500;
+    }
+    return true; // 网络错误、连接中断、范围不符等
+  }
+
+  /*
+   * 带超时与指数退避的分片下载。
+   * 外层 signal 只用于用户取消；超时用内部 controller，两次的 AbortError 可区分。
+   */
+  async function fetchBuffer(url, range, signal, opts) {
+    const attempts = (opts && opts.attempts) || MAX_SEGMENT_ATTEMPTS;
+    const timeoutMs = (opts && opts.timeoutMs) || SEGMENT_TIMEOUT_MS;
     let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (signal && signal.aborted) throw abortError();
+
+      const ctrl = new AbortController();
+      let abortedByOuter = false;
+      const onOuterAbort = () => {
+        abortedByOuter = true;
+        try { ctrl.abort(); } catch (e) { /* ignore */ }
+      };
+      if (signal) signal.addEventListener('abort', onOuterAbort, { once: true });
+      const timer = setTimeout(() => {
+        try { ctrl.abort(); } catch (e) { /* ignore */ }
+      }, timeoutMs);
+
       try {
         const headers = {};
         if (range && range.length) {
@@ -136,7 +197,7 @@
         const res = await fetch(url, {
           headers: headers,
           credentials: 'include',
-          signal: signal,
+          signal: ctrl.signal,
           cache: 'default'
         });
         if (range && range.length && res.status !== 206 && res.status !== 200) {
@@ -148,12 +209,20 @@
         }
         return await res.arrayBuffer();
       } catch (err) {
-        lastError = err;
-        if (err && err.name === 'AbortError') throw err;
-        if (attempt < 2) await sleep(350 * (attempt + 1));
+        if (abortedByOuter || (signal && signal.aborted)) throw abortError();
+        const timedOut = err && err.name === 'AbortError';
+        lastError = timedOut ? new Error('请求超时（' + Math.round(timeoutMs / 1000) + 's）') : err;
+        if (timedOut) lastError.name = 'TimeoutError';
+        if (!isRetryable(lastError) || attempt === attempts - 1) throw lastError;
+        // 指数退避 + 抖动，避免整批分片同时重试打爆服务端
+        const backoff = Math.min(5000, 400 * Math.pow(2, attempt)) + Math.random() * 300;
+        await sleep(backoff);
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onOuterAbort);
       }
     }
-    throw lastError;
+    throw lastError || new Error('下载失败');
   }
 
   async function fetchText(url, signal, noStore) {
@@ -169,7 +238,8 @@
       } catch (err) {
         lastError = err;
         if (err && err.name === 'AbortError') throw err;
-        if (attempt < 2) await sleep(350 * (attempt + 1));
+        if (!isRetryable(err) || attempt === 2) throw err;
+        await sleep(400 * Math.pow(2, attempt));
       }
     }
     throw lastError;
@@ -212,43 +282,197 @@
     return await crypto.subtle.decrypt({ name: 'AES-CBC', iv: iv }, cryptoKey, buffer);
   }
 
-  async function downloadSegments(segments, ctx, label) {
+  /* ---------------- 落盘目标：OPFS 流式 / 内存 Blob 回退 ---------------- */
+  /*
+   * 大文件不整块堆在内存里：分片边下边写进页面源的 OPFS 临时文件，
+   * 收尾时把 File 句柄交给 <a download>（浏览器从磁盘流式读取），内存占用恒定。
+   * 环境不支持 OPFS 或配额不足时，退回内存 Blob（与旧版行为一致）。
+   */
+  class FileSink {
+    constructor() {
+      this.jobId = 'o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      this.name = 'vdh-' + this.jobId + '.part';
+      this.streaming = false;
+      this.parts = [];
+      this.bytes = 0;
+      this.queue = Promise.resolve();
+      this.root = null;
+      this.handle = null;
+      this.writer = null;
+      this.fileUrl = '';
+      this.cleanupTimer = 0;
+    }
+
+    static async create(ctx) {
+      const sink = new FileSink();
+      try {
+        if (!navigator.storage || !navigator.storage.getDirectory) throw new Error('当前环境不支持 OPFS');
+        const est = await navigator.storage.estimate().catch(() => null);
+        // 预留 64MB 余量；配额不够时直接走内存模式，避免写到一半失败
+        if (est && est.quota && (est.quota - (est.usage || 0)) < 64 * 1024 * 1024) {
+          throw new Error('存储配额不足');
+        }
+        sink.root = await navigator.storage.getDirectory();
+        sink.handle = await sink.root.getFileHandle(sink.name, { create: true });
+        sink.writer = await sink.handle.createWritable();
+        sink.streaming = true;
+      } catch (e) {
+        sink.streaming = false;
+        sink.error = String((e && e.message) || e);
+      }
+      if (ctx && ctx.setMode) ctx.setMode(sink.streaming ? 'stream' : 'memory');
+      return sink;
+    }
+
+    async write(view) {
+      const u8 = view instanceof Uint8Array ? view : new Uint8Array(view);
+      this.bytes += u8.byteLength;
+      if (!this.streaming) {
+        this.parts.push(u8);
+        return;
+      }
+      this.queue = this.queue.then(() => this.writer.write(u8));
+      await this.queue;
+    }
+
+    async finish(filename, mime) {
+      if (this.streaming) {
+        await this.queue;
+        await this.writer.close();
+        this.writer = null;
+        const file = await this.handle.getFile();
+        if (!file.size) throw new Error('文件内容为空');
+        // File 是磁盘句柄，createObjectURL 不会把内容读进内存
+        const url = URL.createObjectURL(file);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        (document.body || document.documentElement).appendChild(a);
+        a.click();
+        a.remove();
+        this.fileUrl = url;
+        // 给下载留足读取时间后再清理临时文件与 blob URL
+        this.cleanupTimer = setTimeout(() => { this.cleanup(); }, 300000);
+        return file.size;
+      }
+      if (!this.parts.length) throw new Error('没有可保存的数据');
+      saveBlob(new Blob(this.parts, { type: mime || 'application/octet-stream' }), filename);
+      const size = this.bytes;
+      this.parts = [];
+      return size;
+    }
+
+    async cleanup() {
+      clearTimeout(this.cleanupTimer);
+      if (this.fileUrl) {
+        try { URL.revokeObjectURL(this.fileUrl); } catch (e) { /* ignore */ }
+        this.fileUrl = '';
+      }
+      if (this.root && this.name) {
+        try { await this.root.removeEntry(this.name); } catch (e) { /* ignore */ }
+      }
+    }
+
+    async abort() {
+      if (this.writer) {
+        try { await this.writer.abort(); } catch (e) { /* ignore */ }
+        this.writer = null;
+      }
+      this.parts = [];
+      await this.cleanup();
+    }
+  }
+
+  async function downloadSegments(segments, ctx, label, sink) {
     const total = segments.length;
-    const parts = new Array(total);
     const keyCache = new Map();
     const concurrency = Math.min(total > 24 ? 4 : 2, total);
-    let next = 0;
+
+    // 按分片序号顺序写盘：并发下载完成后只把「连续的就绪前缀」刷出去
+    const pending = new Map();
+    const skipped = new Set();
+    let nextIndex = 0;
+    let writeCursor = 0;
     let done = 0;
+    let failCount = 0;
     let bytes = 0;
+
+    // 容忍少量坏分片：原版按失败率熔断，这里取 5% 且至少 1 段
+    const maxFail = Math.max(1, Math.floor(total * 0.05));
 
     ctx.setPhase(label + ' 0/' + total);
 
+    async function flush() {
+      for (;;) {
+        if (pending.has(writeCursor)) {
+          const buf = pending.get(writeCursor);
+          pending.delete(writeCursor);
+          writeCursor++;
+          await sink.write(buf);
+        } else if (skipped.has(writeCursor)) {
+          skipped.delete(writeCursor);
+          writeCursor++;
+        } else {
+          return;
+        }
+      }
+    }
+
+    function report() {
+      ctx.onProgress({
+        done: done,
+        total: total,
+        bytes: bytes,
+        phase: label + ' ' + done + '/' + total + (failCount ? ' · 跳过 ' + failCount : '')
+      });
+    }
+
     async function worker() {
       for (;;) {
-        if (ctx.cancelled()) throw new Error('已取消');
-        const index = next++;
+        if (ctx.cancelled()) throw abortError();
+        const index = nextIndex++;
         if (index >= total) return;
         const seg = segments[index];
-        let buffer = await fetchBuffer(seg.url, seg.range, ctx.signal);
-        if (seg.key && seg.key.url) {
-          buffer = await decryptSegment(seg.key, buffer, seg.seq, keyCache, ctx.signal);
+        try {
+          let buffer = await fetchBuffer(seg.url, seg.range, ctx.signal);
+          if (seg.key && seg.key.url) {
+            buffer = await decryptSegment(seg.key, buffer, seg.seq, keyCache, ctx.signal);
+          }
+          const view = new Uint8Array(buffer);
+          pending.set(index, view);
+          bytes += view.byteLength;
+          done++;
+          await flush();
+          report();
+        } catch (err) {
+          if (ctx.cancelled() || (err && err.name === 'AbortError')) throw err;
+          failCount++;
+          skipped.add(index);
+          try { await flush(); } catch (e) { throw e; }
+          if (failCount > maxFail) {
+            throw new Error('分片失败过多（' + failCount + '/' + total + '）：' + ((err && err.message) || err));
+          }
+          // 坏分片跳过，继续下载其余部分（丢弃该段会造成短暂缺帧，但保住整个文件）
+          report();
         }
-        parts[index] = new Uint8Array(buffer);
-        done++;
-        bytes += buffer.byteLength;
-        ctx.onProgress({
-          done: done,
-          total: total,
-          bytes: bytes,
-          phase: label + ' ' + done + '/' + total
-        });
       }
     }
 
     const workers = [];
     for (let i = 0; i < concurrency; i++) workers.push(worker());
-    await Promise.all(workers);
-    return { parts: parts, bytes: bytes };
+    const results = await Promise.allSettled(workers);
+    // 任一 worker 抛错（取消 / 超出失败阈值）时整体失败
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        const err = r.reason;
+        if (err && err.name !== 'AbortError') throw err;
+        if (ctx.cancelled()) throw err;
+      }
+    }
+    await flush();
+    if (failCount && ctx.addSkipped) ctx.addSkipped(failCount);
+    return { bytes: bytes, failCount: failCount };
   }
 
   function saveBlob(blob, filename) {
@@ -262,6 +486,7 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 120000);
   }
+
 
   /* ---------------- 命名 ---------------- */
 
@@ -311,11 +536,13 @@
    * 无 ENDLIST 的播放列表会持续滚动，需要按轮询刷新并累积新增分片。
    * 用户取消或达到内存上限时停止录制，并把已录内容保存为文件。
    */
-  async function recordLivePlaylist(playlist, mediaUrl, parts, ctx, keyCache) {
+  async function recordLivePlaylist(playlist, mediaUrl, sink, ctx, keyCache) {
     const seen = new Set();
     const interval = Math.max(1500, Math.min(10000, ((playlist.targetDuration || 4) * 1000) / 2));
     let recorded = 0;
     let bytes = 0;
+    // 内存模式才有上限；流式写盘时只受磁盘/配额限制
+    const limit = sink.streaming ? Infinity : LIVE_MEMORY_LIMIT;
 
     ctx.setPhase('直播录制中 · 已录 0 段');
 
@@ -331,7 +558,7 @@
           if (seg.key && seg.key.url) {
             buffer = await decryptSegment(seg.key, buffer, seg.seq, keyCache, ctx.signal);
           }
-          parts.push(new Uint8Array(buffer));
+          await sink.write(new Uint8Array(buffer));
           bytes += buffer.byteLength;
           recorded++;
           ctx.onProgress({
@@ -351,7 +578,7 @@
     for (;;) {
       await downloadNew(playlist.segments);
       if (ctx.cancelled()) break;
-      if (bytes >= LIVE_MEMORY_LIMIT) {
+      if (bytes >= limit) {
         ctx.setPhase('已达内存上限，停止录制并保存');
         break;
       }
@@ -426,6 +653,11 @@
       const parsed = VDH.parseMediaPlaylist(text, url);
       result.live = !parsed.endList;
       result.segmentCount = parsed.segments.length;
+      const reason = hlsDrmReason(parsed);
+      if (reason) {
+        result.drm = true;
+        result.drmReason = reason;
+      }
     }
 
     probeCache.set(url, result);
@@ -480,32 +712,40 @@
     if (!playlist.segments.length) throw new Error('播放列表中未找到媒体分片');
     const isLive = !playlist.endList;
 
+    // 采样级加密 / DRM：不下载，直接标记给弹窗说明原因
+    const drmReason = hlsDrmReason(playlist);
+    if (drmReason) {
+      send({ type: 'vdh:flag', key: entry.key, drm: true, reason: drmReason });
+      throw new Error(drmReason);
+    }
+
     const isFmp4 = !!playlist.init ||
       playlist.segments.some((s) => /\.(m4s|mp4|m4v|m4a)(\?|$)/i.test(s.url));
     const ext = isFmp4 ? 'mp4' : 'ts';
     const quality = qualityLabel(entry, variant);
     const base = baseTitle(entry);
 
-    const parts = [];
-    if (playlist.init) {
-      ctx.setPhase('下载初始化分片');
-      const initBuf = await fetchBuffer(playlist.init.url, playlist.init.range, ctx.signal);
-      parts.push(new Uint8Array(initBuf));
-    }
+    const sink = await FileSink.create(ctx);
+    try {
+      if (playlist.init) {
+        ctx.setPhase('下载初始化分片');
+        const initBuf = await fetchBuffer(playlist.init.url, playlist.init.range, ctx.signal);
+        await sink.write(new Uint8Array(initBuf));
+      }
 
-    if (isLive) {
-      // 直播 / 无 ENDLIST：持续录制新增分片，取消后保存已录内容
-      await recordLivePlaylist(playlist, mediaUrl, parts, ctx, new Map());
-    } else {
-      const videoResult = await downloadSegments(playlist.segments, ctx, '下载视频分片');
-      parts.push.apply(parts, videoResult.parts);
-    }
+      if (isLive) {
+        // 直播 / 无 ENDLIST：持续录制新增分片，取消后保存已录内容
+        await recordLivePlaylist(playlist, mediaUrl, sink, ctx, new Map());
+      } else {
+        await downloadSegments(playlist.segments, ctx, '下载视频分片', sink);
+      }
 
-    ctx.setPhase('保存视频文件');
-    saveBlob(
-      new Blob(parts, { type: isFmp4 ? 'video/mp4' : 'video/mp2t' }),
-      buildName(base, quality, ext)
-    );
+      ctx.setPhase('保存视频文件');
+      await sink.finish(buildName(base, quality, ext), isFmp4 ? 'video/mp4' : 'video/mp2t');
+    } catch (err) {
+      await sink.abort();
+      throw err;
+    }
 
     // 部分 HLS 把音频单独放在 EXT-X-MEDIA 中，需要额外下载一个音频文件
     if (audioUrl && !ctx.cancelled()) {
@@ -513,28 +753,49 @@
       const audioText = await fetchText(audioUrl, ctx.signal);
       const audioPlaylist = VDH.parseMediaPlaylist(audioText, audioUrl);
       if (audioPlaylist.segments.length) {
-        const audioParts = [];
-        if (audioPlaylist.init) {
-          const initBuf = await fetchBuffer(audioPlaylist.init.url, audioPlaylist.init.range, ctx.signal);
-          audioParts.push(new Uint8Array(initBuf));
-        }
-        if (!audioPlaylist.endList) {
-          await recordLivePlaylist(audioPlaylist, audioUrl, audioParts, ctx, new Map());
-        } else {
-          const audioResult = await downloadSegments(audioPlaylist.segments, ctx, '下载音频分片');
-          audioParts.push.apply(audioParts, audioResult.parts);
-        }
+        const audioSink = await FileSink.create(ctx);
+        try {
+          if (audioPlaylist.init) {
+            const initBuf = await fetchBuffer(audioPlaylist.init.url, audioPlaylist.init.range, ctx.signal);
+            await audioSink.write(new Uint8Array(initBuf));
+          }
+          if (!audioPlaylist.endList) {
+            await recordLivePlaylist(audioPlaylist, audioUrl, audioSink, ctx, new Map());
+          } else {
+            await downloadSegments(audioPlaylist.segments, ctx, '下载音频分片', audioSink);
+          }
 
-        const audioFmp4 = !!audioPlaylist.init ||
-          /\.(m4s|mp4|m4a)(\?|$)/i.test(audioPlaylist.segments[0].url);
-        ctx.setPhase('保存音频文件');
-        // TS 封装下音频仍是 MPEG-TS 流，使用 .ts 扩展名便于播放器识别
-        saveBlob(
-          new Blob(audioParts, { type: audioFmp4 ? 'audio/mp4' : 'video/mp2t' }),
-          buildName(base + ' audio', quality, audioFmp4 ? 'm4a' : 'ts')
-        );
+          const audioFmp4 = !!audioPlaylist.init ||
+            /\.(m4s|mp4|m4a)(\?|$)/i.test(audioPlaylist.segments[0].url);
+          ctx.setPhase('保存音频文件');
+          // TS 封装下音频仍是 MPEG-TS 流，使用 .ts 扩展名便于播放器识别
+          await audioSink.finish(
+            buildName(base + ' audio', quality, audioFmp4 ? 'm4a' : 'ts'),
+            audioFmp4 ? 'audio/mp4' : 'video/mp2t'
+          );
+        } catch (err) {
+          await audioSink.abort();
+          throw err;
+        }
       }
     }
+  }
+
+  /* 采样级加密（SAMPLE-AES / SAMPLE-AES-CTR）需要 DRM，AES-128 由本扩展自行解密 */
+  function hlsDrmReason(playlist) {
+    const methods = new Set();
+    for (const seg of playlist.segments) {
+      if (seg.key && seg.key.method) methods.add(String(seg.key.method).toUpperCase());
+    }
+    for (const m of methods) {
+      if (m === 'SAMPLE-AES' || m === 'SAMPLE-AES-CTR') {
+        return 'HLS 采样级加密（' + m + '），需要 DRM 授权，无法直接下载';
+      }
+      if (m !== 'AES-128' && m !== 'NONE') {
+        return '不支持的 HLS 加密方式：' + m;
+      }
+    }
+    return '';
   }
 
   /* ---------------- DASH 下载 ---------------- */
@@ -546,12 +807,46 @@
     })[0];
   }
 
+  /* 整文件流式下载：边读边写，避免 arrayBuffer 把大文件整块压在内存里 */
+  async function downloadWholeInto(url, ctx, sink, label) {
+    const res = await fetch(url, { credentials: 'include', signal: ctx.signal });
+    if (!res.ok && res.status !== 206) throw new Error('HTTP ' + res.status);
+    const total = parseInt(res.headers.get('content-length') || '0', 10) || 0;
+
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      const buf = await res.arrayBuffer();
+      await sink.write(new Uint8Array(buf));
+      ctx.onProgress({ done: buf.byteLength, total: total || buf.byteLength, bytes: buf.byteLength, phase: label });
+      return buf.byteLength;
+    }
+
+    const reader = res.body.getReader();
+    let bytes = 0;
+    for (;;) {
+      if (ctx.cancelled()) {
+        try { await reader.cancel(); } catch (e) { /* ignore */ }
+        throw abortError();
+      }
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      await sink.write(chunk.value);
+      bytes += chunk.value.byteLength;
+      ctx.onProgress({
+        done: bytes,
+        total: total || 0,
+        bytes: bytes,
+        phase: label + (total ? ' ' + Math.floor((bytes / total) * 100) + '%' : '')
+      });
+    }
+    if (!bytes) throw new Error('下载内容为空');
+    return bytes;
+  }
+
   /*
    * SegmentBase（单文件 DASH）：下载 init + sidx 索引，再按索引范围下载子段并合并；
-   * 没有可用索引时退回整文件下载。
+   * 没有可用索引时退回整文件流式下载。
    */
-  async function collectDashSingleFile(rep, ctx, label) {
-    const parts = [];
+  async function collectDashSingleFile(rep, ctx, label, sink) {
     const indexRange = rep.index && !rep.index.external ? rep.index.range : null;
     const initRange = rep.init ? rep.init.range : null;
 
@@ -562,9 +857,8 @@
 
     if (overlap) {
       ctx.setPhase('下载' + label + '完整文件');
-      const whole = await fetchBuffer(rep.baseUrl, null, ctx.signal);
-      ctx.onProgress({ done: 1, total: 1, bytes: whole.byteLength, phase: '下载' + label + '完整文件' });
-      return [new Uint8Array(whole)];
+      await downloadWholeInto(rep.baseUrl, ctx, sink, '下载' + label + '完整文件');
+      return;
     }
 
     if (rep.init) {
@@ -572,7 +866,7 @@
       if (!sameAsMedia) {
         ctx.setPhase('下载' + label + '初始化分片');
         const initBuf = await fetchBuffer(rep.init.url, initRange, ctx.signal);
-        parts.push(new Uint8Array(initBuf));
+        await sink.write(new Uint8Array(initBuf));
       }
     }
 
@@ -594,20 +888,25 @@
         url: rep.baseUrl,
         range: { start: ref.start, length: ref.length }
       }));
-      const result = await downloadSegments(segments, ctx, '下载' + label + '分片');
-      parts.push.apply(parts, result.parts);
-      return parts;
+      await downloadSegments(segments, ctx, '下载' + label + '分片', sink);
+      return;
     }
 
     ctx.setPhase('下载' + label + '完整文件');
-    const whole = await fetchBuffer(rep.baseUrl, null, ctx.signal);
-    ctx.onProgress({ done: 1, total: 1, bytes: whole.byteLength, phase: '下载' + label + '完整文件' });
-    return [new Uint8Array(whole)];
+    await downloadWholeInto(rep.baseUrl, ctx, sink, '下载' + label + '完整文件');
   }
 
   async function downloadDash(entry, ctx) {
     ctx.setPhase('解析 MPD');
     const text = await fetchText(entry.url, ctx.signal);
+
+    // ContentProtection 是 DASH 的 DRM 标志（Widevine/PlayReady 等）
+    if (/<[^>]*ContentProtection/i.test(text)) {
+      const reason = 'DASH 含 ContentProtection（DRM 保护），无法直接下载';
+      send({ type: 'vdh:flag', key: entry.key, drm: true, reason: reason });
+      throw new Error(reason);
+    }
+
     const mpd = VDH.parseMpd(text, entry.url);
 
     const video = pickBestDash(mpd.videos);
@@ -625,32 +924,33 @@
     for (const track of tracks) {
       const rep = track.rep;
       const label = track.kind === 'video' ? '视频' : '音频';
-      let parts;
-
-      if (rep.singleFile) {
-        parts = await collectDashSingleFile(rep, ctx, label);
-      } else {
-        parts = [];
-        if (rep.init) {
-          ctx.setPhase('下载' + label + '初始化分片');
-          const initBuf = await fetchBuffer(rep.init.url, rep.init.range, ctx.signal);
-          parts.push(new Uint8Array(initBuf));
-        }
-
-        const result = await downloadSegments(rep.segments, ctx, '下载' + label + '分片');
-        parts.push.apply(parts, result.parts);
-      }
-
       const mime = String(rep.mime || '').toLowerCase();
       const ext = mime.indexOf('webm') >= 0 ? 'webm' : (track.kind === 'audio' ? 'm4a' : 'mp4');
       const quality = rep.height ? rep.height + 'p' : '';
       const suffix = track.kind === 'audio' && tracks.length > 1 ? ' audio' : '';
 
-      ctx.setPhase('保存' + label + '文件');
-      saveBlob(
-        new Blob(parts, { type: mime || (track.kind === 'audio' ? 'audio/mp4' : 'video/mp4') }),
-        buildName(base + suffix, quality, ext)
-      );
+      const sink = await FileSink.create(ctx);
+      try {
+        if (rep.singleFile) {
+          await collectDashSingleFile(rep, ctx, label, sink);
+        } else {
+          if (rep.init) {
+            ctx.setPhase('下载' + label + '初始化分片');
+            const initBuf = await fetchBuffer(rep.init.url, rep.init.range, ctx.signal);
+            await sink.write(new Uint8Array(initBuf));
+          }
+          await downloadSegments(rep.segments, ctx, '下载' + label + '分片', sink);
+        }
+
+        ctx.setPhase('保存' + label + '文件');
+        await sink.finish(
+          buildName(base + suffix, quality, ext),
+          mime || (track.kind === 'audio' ? 'audio/mp4' : 'video/mp4')
+        );
+      } catch (err) {
+        await sink.abort();
+        throw err;
+      }
     }
 
     if (tracks.length > 1) {
@@ -663,12 +963,16 @@
   function downloadDirectViaPage(url, filename) {
     runJob(filename || '视频下载', async (ctx) => {
       ctx.setPhase('页面内下载中');
-      const res = await fetch(url, { credentials: 'include' });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const blob = await res.blob();
-      if (!blob.size) throw new Error('下载内容为空');
-      ctx.onProgress({ done: 1, total: 1, bytes: blob.size, phase: '保存文件' });
-      saveBlob(blob, VDH.sanitizeFilename(filename, 'video'));
+      const sink = await FileSink.create(ctx);
+      try {
+        const bytes = await downloadWholeInto(url, ctx, sink, '页面内下载中');
+        if (!bytes) throw new Error('下载内容为空');
+        ctx.setPhase('保存文件');
+        await sink.finish(VDH.sanitizeFilename(filename, 'video'), '');
+      } catch (err) {
+        await sink.abort();
+        throw err;
+      }
     }).catch(() => {});
   }
 
@@ -841,6 +1145,9 @@
         probeStream(msg.url)
           .then((result) => {
             send({ type: 'vdh:variants', key: msg.key || '', payload: result });
+            if (result && result.drm) {
+              send({ type: 'vdh:flag', key: msg.key || '', drm: true, reason: result.drmReason || '' });
+            }
             sendResponse({ ok: true, result: result });
           })
           .catch((err) => sendResponse({

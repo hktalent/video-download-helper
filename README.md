@@ -7,11 +7,14 @@ Chrome / Edge 与 Firefox 共用同一套代码，打包脚本会分别生成两
 
 - **媒体检测**
   - `webRequest` 监听页面请求，按 MIME / 扩展名识别直链、HLS、DASH、字幕
+  - 直链体积优先取 `Content-Range` 总量（只回 206 的 CDN 也能显示真实大小），并记录是否支持 Range
+  - HLS `SAMPLE-AES` / DASH `ContentProtection` 标记为 DRM，弹窗标红并禁用下载
   - 扫描页面 `<video>` / `<audio>`（含 `currentSrc`、`<source>`），并在 `loadedmetadata` / `play` 时刷新
   - 徽标显示当前标签页检测到的条目数；正在合并下载时显示 `↓`
 - **HLS 下载**
   - 解析主播放列表：**可选清晰度下拉框**、独立音轨（`EXT-X-MEDIA`）、多语言字幕
-  - 分片并发下载 + 自动重试，按 `EXT-X-BYTERANGE` / `EXT-X-MAP` 正确拼接（fMP4 与 TS 都支持）
+  - 分片并发下载 + 6 次指数退避重试 + 单请求 20s 超时，按 `EXT-X-BYTERANGE` / `EXT-X-MAP` 正确拼接（fMP4 与 TS 都支持）
+  - 坏分片容忍：单段失败按序号跳过，失败率超过 5% 才中止，完成态会标出「跳过 N 个损坏分片」
   - `EXT-X-KEY: AES-128`（含 `IV` 与按序号推导两种模式）在本机解密
   - 无 `EXT-X-ENDLIST` 的直播列表按目标时长轮询，持续录制新增分片，取消时保存已录部分
 - **DASH 下载**
@@ -22,6 +25,9 @@ Chrome / Edge 与 Firefox 共用同一套代码，打包脚本会分别生成两
   - 在主世界挂钩 `MediaSource.addSourceBuffer` / `SourceBuffer.appendBuffer`，按 mime 分轨累积
   - 仅在用户点击「开始捕获」后落盘，单页上限 900 MB，超限自动停止避免拖垮页面
   - 多 iframe 场景按帧汇总字节数与轨道，不会互相覆盖
+- **落盘（OPFS 流式）**
+  - 分片边下边写进页面源 OPFS 临时文件，收尾把 `File` 句柄交给浏览器下载，**内存占用恒定**，GB 级视频不再爆内存
+  - 环境不支持 OPFS / 配额不足 64MB 时自动退回内存 Blob（行为与旧版一致）
 - **下载策略**
   - 直链默认交给浏览器下载器；被防盗链拦截（Referer / Cookie 校验）时自动回退到页面内 `fetch` 保存
   - 「页内下载」开关：强制所有直链走页面上下文下载，原样带上 Cookie / Referer
@@ -67,9 +73,9 @@ npx web-ext lint --source-dir dist/firefox   # Firefox 清单/API 静态检查
 
 ## 已知限制
 
-- **不支持 DRM（Widevine / PlayReady）**：加密受保护内容无法解密，扩展会直接报错
-- HLS 的独立音频轨、DASH 的音频轨都是单独文件，需要自行用 ffmpeg 合并：
+- **不支持 DRM（Widevine / PlayReady / 采样级加密）**：会在弹窗里标红并禁用下载，不会白跑一次下载
+- HLS 的独立音频轨、DASH 的音频轨仍是单独文件，需要自行用 ffmpeg 合并（容器层合并尚未实现）：
   `ffmpeg -i video.mp4 -i audio.m4a -c copy out.mp4`
 - MSE 捕获只能保存播放器**已经加载过**的数据，拖动进度条没看过的部分无法补回
-- 直播录制占用内存，长时间录制建议改用 m3u8 URL 交给外部工具（如 ffmpeg / N_m3u8DL）
-- HLS 的 `SAMPLE-AES` 与 DASH 的 `ContentProtection` 均视为加密内容，不做处理
+- 直播录制在支持 OPFS 的环境下不受内存上限约束；不支持时会退到内存模式（2GB 上限）
+- OPFS 临时文件在下载结束后保留 5 分钟再清理，期间会短暂占用页面源的存储配额

@@ -373,6 +373,20 @@ body {
   background: #e0578a;
 }
 
+/* DRM / 受保护流的标记与说明 */
+.badge.drm {
+  background: #d64545;
+}
+
+.drm-note {
+  flex-basis: 100%;
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: #d64545;
+  opacity: 0.9;
+}
+
 .btns {
   display: flex;
   gap: 2px;

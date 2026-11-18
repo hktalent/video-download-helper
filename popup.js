@@ -167,7 +167,8 @@ function renderList() {
       const extra = probe
         ? (probe.variants ? probe.variants.length : 0) + ':' + (probe.subtitles ? probe.subtitles.length : 0)
         : '-';
-      return [item.key, item.kind, item.size, item.title, item.height, item.duration, extra].join('~');
+      return [item.key, item.kind, item.size, item.title, item.height, item.duration,
+        extra, item.drm ? 'drm' : '', item.drmReason || ''].join('~');
     })
     .join('|') + '#' + (hasBlob ? '1' : '0') + '@' + query;
 
@@ -258,7 +259,8 @@ function itemRow(item) {
 
   const badge = document.createElement('span');
   badge.className = 'badge ' + (item.kind === 'file' ? 'file' : item.kind);
-  badge.textContent = badgeText(item);
+  if (item.drm) badge.classList.add('drm');
+  badge.textContent = item.drm ? 'DRM' : badgeText(item);
   sub.appendChild(badge);
 
   const info = [];
@@ -272,6 +274,14 @@ function itemRow(item) {
     sub.appendChild(text);
   }
 
+  // 受保护流：显式说明原因，并把下载按钮置灰（点了也只会失败）
+  if (item.drm) {
+    const warn = document.createElement('div');
+    warn.className = 'drm-note';
+    warn.textContent = item.drmReason || '该流受 DRM 保护，无法下载';
+    sub.appendChild(warn);
+  }
+
   meta.appendChild(name);
   meta.appendChild(sub);
 
@@ -280,7 +290,12 @@ function itemRow(item) {
 
   const btns = document.createElement('div');
   btns.className = 'btns';
-  btns.appendChild(iconButton('download', '下载到本地', ICON.download));
+  const dl = iconButton('download', '下载到本地', ICON.download);
+  if (item.drm) {
+    dl.disabled = true;
+    dl.title = 'DRM 保护，无法下载';
+  }
+  btns.appendChild(dl);
   btns.appendChild(iconButton('copy', '复制链接', ICON.copy));
 
   row.appendChild(thumb);
