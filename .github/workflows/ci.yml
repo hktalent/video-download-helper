@@ -16,9 +16,9 @@ jobs:
     name: 单测与打包校验
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -32,7 +32,7 @@ jobs:
         run: npx --yes web-ext@8 lint --source-dir dist/firefox --self-hosted
 
       - name: 上传开发产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: extension-dev-${{ github.sha }}
           path: |
