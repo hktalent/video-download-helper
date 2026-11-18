@@ -1,5 +1,6 @@
-dist/chrome/
-dist/firefox/
+# 打包产物全部由 tools/build.mjs 生成，不进版本库
+dist/
+.web-ext-artifacts/
 node_modules/
 .DS_Store
 *.log

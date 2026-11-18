@@ -4,6 +4,11 @@
   "version": "1.0.0",
   "description": "检测并下载当前页面中的视频与音频：直链文件、HLS(m3u8)、DASH(mpd) 以及 MSE(blob) 流。",
   "minimum_chrome_version": "111",
+  "homepage_url": "https://github.com/hktalent/video-download-helper",
+  "developer": {
+    "name": "hktalent",
+    "url": "https://github.com/hktalent"
+  },
   "permissions": [
     "webRequest",
     "downloads",

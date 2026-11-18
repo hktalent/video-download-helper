@@ -1,7 +1,19 @@
 # Video Download Helper
 
+[![CI](https://github.com/hktalent/video-download-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/hktalent/video-download-helper/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/hktalent/video-download-helper?display_name=tag)](https://github.com/hktalent/video-download-helper/releases/latest)
+
 浏览器扩展：检测并下载当前页面里的视频与音频，覆盖直链文件、HLS(m3u8)、DASH(mpd) 和 MSE(blob) 流。
 Chrome / Edge 与 Firefox 共用同一套代码，打包脚本会分别生成两个发行包。
+
+> 本仓库为 **hktalent 专属维护版本**（<https://github.com/hktalent/video-download-helper>），
+> 扩展 ID 固定为 `video-download-helper@hktalent.github.io`，发行包只在 Releases 页面发布。
+
+**直接下载最新版**
+
+- Chrome / Edge：<https://github.com/hktalent/video-download-helper/releases/latest/download/video-download-helper-chrome.zip>
+- Firefox（≥128）：<https://github.com/hktalent/video-download-helper/releases/latest/download/video-download-helper-firefox.xpi>
+
 
 ## 功能
 
@@ -36,8 +48,7 @@ Chrome / Edge 与 Firefox 共用同一套代码，打包脚本会分别生成两
 ## 目录结构
 
 ```
-manifest.json         Chrome / Edge 清单（MV3 service worker）
-manifest.firefox.json 仅供参考的 Firefox 清单样例（由 tools/build.mjs 生成对应版本）
+manifest.json         Chrome / Edge 清单（MV3 service worker，Firefox 版本由打包脚本转换生成）
 background.js         后台：请求监听、条目汇总、下载、徽标
 content.js            内容脚本：扫描、HLS/DASH 合并下载、清晰度探测、字幕、MSE 桥接
 inject.js             主世界脚本：MSE 挂钩
@@ -45,8 +56,11 @@ lib/stream.js         HLS / DASH / sidx 解析（可被 node 直接 require 做�
 popup.html/js/css     弹窗界面
 icons/                图标
 test/parsers.test.js  解析器单元测试
-tools/build.mjs       打包脚本
-dist/                 打包产物（chrome.zip / firefox.xpi）
+tools/build.mjs       打包脚本（生成 chrome.zip / firefox.xpi）
+tools/release.mjs     发版脚本：改版本号 → 单测 → 提交 → 打 tag →（可选）推送
+package.json          npm 脚本入口（test / build / release:*）
+.github/workflows/    CI（推送与 PR 校验）与 Release（推 tag 自动打包发布）
+dist/                 打包产物，本地生成，已加入 .gitignore
 ```
 
 ## 安装
@@ -58,7 +72,7 @@ dist/                 打包产物（chrome.zip / firefox.xpi）
 
 **Firefox（≥128）**
 
-1. 先打包：`node tools/build.mjs`
+1. 先打包：`npm run build`
 2. 打开 `about:debugging#/runtime/this-firefox`
 3. 「临时载入附加组件」，选择 `dist/video-download-helper-firefox.xpi`
 4. 长期使用可用 `dist/firefox/` 目录打包签名后安装；Firefox 140+ 已在清单里声明不收集数据
@@ -66,10 +80,33 @@ dist/                 打包产物（chrome.zip / firefox.xpi）
 ## 开发与校验
 
 ```bash
-node --test test/parsers.test.js   # 解析器单测
-node tools/build.mjs               # 生成两个发行包
-npx web-ext lint --source-dir dist/firefox   # Firefox 清单/API 静态检查
+npm test                            # 解析器单测
+npm run build                       # 生成两个发行包
+npm run lint:firefox                # Firefox 清单/API 静态检查
+node tools/build.mjs --expect-version 1.0.0   # 校验清单版本与目标版本一致
 ```
+
+## 发版（自动打包 + 发布）
+
+版本号只在 `manifest.json`（并在发版时同步 `package.json`）维护，**推 tag 即发布**：
+
+```bash
+npm run release:patch    # 1.0.0 → 1.0.1，提交 + 打 tag + 推送
+npm run release:minor    # → 1.1.0
+npm run release:major    # → 2.0.0
+npm run release -- 1.2.3 --push        # 指定版本号
+node tools/release.mjs patch --dry-run # 只看要发的版本，不动仓库
+```
+
+`git push` 带上 `v*` tag 后，`.github/workflows/release.yml` 会自动：
+
+1. 校验 tag 与 `manifest.json` 版本一致、`homepage_url` 归属 hktalent 仓库
+2. 跑单测 → 打包 Chrome / Firefox → `web-ext lint` 静态检查 → 校验包内清单
+3. 生成 `SHA256SUMS.txt`，上传 Actions 产物
+4. 创建 GitHub Release，附上 `video-download-helper-chrome.zip`、`video-download-helper-firefox.xpi` 和校验和
+
+只在 Actions 页面手动 Run 时是 dry run：只构建产物、不创建 Release。
+普通 push / PR 走 `ci.yml`，只做单测、打包与静态检查，避免往版本库里提交二进制。
 
 ## 已知限制
 

@@ -1,0 +1,142 @@
+name: Release
+
+# 推送 v* tag 即自动打包并发布 GitHub Release。
+# 切到 Actions 页面手动点 Run 时只构建产物（dry run），不创建 Release。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  build:
+    name: 校验并打包
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 读取版本号
+        id: meta
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "清单版本：$VERSION"
+
+      - name: 校验 tag 与 manifest 版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          echo "tag=$TAG_VERSION manifest=$MANIFEST_VERSION"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 manifest.json 版本 ${MANIFEST_VERSION} 不一致"
+            exit 1
+          fi
+
+      - name: 校验仓库归属
+        run: |
+          node -e "
+            const m = require('./manifest.json');
+            const url = m.homepage_url || '';
+            if (!url.includes('hktalent/video-download-helper')) {
+              throw new Error('homepage_url 未指向 hktalent/video-download-helper：' + url);
+            }
+            console.log('归属校验通过：' + url);
+          "
+
+      - name: 单元测试
+        run: node --test test/parsers.test.js
+
+      - name: 打包 Chrome / Firefox
+        run: node tools/build.mjs --expect-version "${{ steps.meta.outputs.version }}"
+
+      - name: Firefox 清单静态检查
+        run: npx --yes web-ext@8 lint --source-dir dist/firefox --self-hosted
+
+      - name: 校验产物结构
+        run: |
+          set -euo pipefail
+          unzip -l dist/video-download-helper-chrome.zip | tee /tmp/chrome.txt
+          grep -q 'manifest.json' /tmp/chrome.txt
+          grep -q 'background.js' /tmp/chrome.txt
+          grep -q 'popup.html' /tmp/chrome.txt
+          unzip -p dist/video-download-helper-chrome.zip manifest.json | node -e "
+            let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+              const m=JSON.parse(s);
+              if (m.background?.service_worker!=='background.js') throw new Error('Chrome 清单后台声明异常');
+              console.log('Chrome manifest ok, version=' + m.version);
+            })"
+          unzip -p dist/video-download-helper-firefox.xpi manifest.json | node -e "
+            let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+              const m=JSON.parse(s);
+              const id=m.browser_specific_settings?.gecko?.id || '';
+              if (!id) throw new Error('Firefox 清单缺少 gecko id');
+              if (m.background?.service_worker) throw new Error('Firefox 清单不应含 service_worker');
+              console.log('Firefox manifest ok, id=' + id);
+            })"
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum video-download-helper-chrome.zip video-download-helper-firefox.xpi > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-v${{ steps.meta.outputs.version }}
+          path: |
+            dist/video-download-helper-chrome.zip
+            dist/video-download-helper-firefox.xpi
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 发布 GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-v${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/video-download-helper-chrome.zip
+            dist/video-download-helper-firefox.xpi
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            **Video Download Helper ${{ github.ref_name }}**（hktalent 专属构建）
+
+            - `video-download-helper-chrome.zip` — Chrome / Edge（MV3）解压后「加载已解压的扩展程序」
+            - `video-download-helper-firefox.xpi` — Firefox ≥128（`about:debugging` 临时载入，或签名后长期安装）
+            - `SHA256SUMS.txt` — 产物校验和

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  test:
+    name: 单测与打包校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 单元测试
+        run: node --test test/parsers.test.js
+
+      - name: 打包
+        run: node tools/build.mjs
+
+      - name: Firefox 清单静态检查
+        run: npx --yes web-ext@8 lint --source-dir dist/firefox --self-hosted
+
+      - name: 上传开发产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-dev-${{ github.sha }}
+          path: |
+            dist/video-download-helper-chrome.zip
+            dist/video-download-helper-firefox.xpi
+          if-no-files-found: error
+          retention-days: 7

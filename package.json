@@ -1,0 +1,28 @@
+{
+  "name": "video-download-helper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "浏览器扩展：检测并下载当前页面里的视频与音频（直链 / HLS / DASH / MSE）",
+  "author": "hktalent",
+  "homepage": "https://github.com/hktalent/video-download-helper",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/hktalent/video-download-helper.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/parsers.test.js",
+    "build": "node tools/build.mjs",
+    "lint:firefox": "web-ext lint --source-dir dist/firefox",
+    "release": "node tools/release.mjs",
+    "release:patch": "node tools/release.mjs patch --push",
+    "release:minor": "node tools/release.mjs minor --push",
+    "release:major": "node tools/release.mjs major --push"
+  },
+  "devDependencies": {
+    "web-ext": "^8.9.0"
+  }
+}
