@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Download Helper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="logo" src="icons/icon32.png" alt="">
+      <div class="brand-text">
+        <span class="brand-name">Video Download Helper</span>
+        <span class="brand-host" id="host">—</span>
+      </div>
+    </div>
+    <div class="tools">
+      <button class="icon-btn" id="btn-scan" title="重新扫描页面" aria-label="重新扫描页面">
+        <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.6"/><path d="M20 4v7h-7"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-clear" title="清空已检测列表" aria-label="清空已检测列表">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+
+  <div class="searchbar">
+    <input class="search" id="search" type="search" placeholder="搜索标题或链接" autocomplete="off">
+    <label class="toggle" title="直链改用页面内下载，可带上 Cookie / Referer">
+      <input type="checkbox" id="prefer-page">
+      <span>页内下载</span>
+    </label>
+  </div>
+
+  <main class="list" id="list"></main>
+
+  <section class="card" id="job-card" hidden>
+    <div class="card-head">
+      <span class="card-title" id="job-title">下载中</span>
+      <button class="icon-btn danger" id="btn-cancel" title="取消任务" aria-label="取消任务">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="progress"><div class="progress-bar" id="job-bar"></div></div>
+    <div class="job-meta">
+      <span id="job-phase">准备中</span>
+      <span id="job-stat"></span>
+    </div>
+  </section>
+
+  <section class="card" id="mse-card" hidden>
+    <div class="card-head">
+      <span class="tag">MSE</span>
+      <span class="card-title">blob 流捕获</span>
+    </div>
+    <div class="mse-meta" id="mse-meta"></div>
+    <div class="mse-hint" id="mse-hint">先点「开始捕获」，再刷新页面并播放视频；播放完成后点「保存」。仅能保存播放器已加载的数据，未播放部分无法获取。</div>
+    <div class="mse-actions">
+      <button class="pill" id="mse-start">开始捕获</button>
+      <button class="pill primary" id="mse-save" disabled>保存</button>
+      <button class="pill ghost" id="mse-reset">清空</button>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span id="hint">直链直接下载；HLS/DASH 在页面内合并后保存，期间请保持页面打开。</span>
+  </footer>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

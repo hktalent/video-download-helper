@@ -1,0 +1,5 @@
+dist/chrome/
+dist/firefox/
+node_modules/
+.DS_Store
+*.log
